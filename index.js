@@ -22,6 +22,9 @@ const API_BASE = (
 
 const API_KEY = process.env.API_KEY;
 
+// CHANNEL ID KAMU
+const PANEL_CHANNEL_ID = "1544164307682721866";
+
 if (!process.env.DISCORD_TOKEN) {
   console.error("ERROR: DISCORD_TOKEN belum diisi.");
   process.exit(1);
@@ -33,11 +36,7 @@ if (!API_KEY) {
 }
 
 /*
- * Temporary session:
- * Discord User ID -> email yang terakhir dikirim.
- *
- * Session ini berada di memory.
- * Kalau Render restart/redeploy, session akan hilang.
+ * User ID Discord -> session email
  */
 const sessions = new Map();
 
@@ -63,7 +62,7 @@ function validHttpUrl(value) {
 }
 
 /* =========================
-   DISCORD PANEL
+   PANEL
 ========================= */
 
 function createPanel() {
@@ -71,16 +70,19 @@ function createPanel() {
     .setTitle("Generate Acc AM Premium")
     .setDescription(
       [
-        "Gunakan tombol di bawah.",
+        "Gunakan tombol di bawah untuk memproses akun AM Premium.",
         "",
-        "**1. Send Email**",
+        "📧 **Send Email**",
         "Masukkan email yang ingin digunakan.",
         "",
-        "**2. Aktivasi**",
-        "Masukkan Magic Link dari email.",
+        "⚡ **Aktivasi**",
+        "Masukkan Magic Link yang diterima melalui email.",
         "",
-        "**3. Reset**",
-        "Hapus session email kamu.",
+        "🔄 **Reset**",
+        "Reset session email kamu.",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Pastikan email yang dimasukkan benar.",
       ].join("\n")
     )
     .setColor(0xa9cdea);
@@ -174,7 +176,7 @@ async function apiVerify(email, magicLink) {
 }
 
 /* =========================
-   API ERROR HELPER
+   API MESSAGE
 ========================= */
 
 function getApiMessage(data) {
@@ -186,255 +188,417 @@ function getApiMessage(data) {
 }
 
 /* =========================
+   SEND / UPDATE PANEL
+========================= */
+
+async function setupPanel() {
+  try {
+    const channel = await client.channels.fetch(
+      PANEL_CHANNEL_ID
+    );
+
+    if (!channel) {
+      console.error(
+        "ERROR: Channel tidak ditemukan."
+      );
+      return;
+    }
+
+    if (!channel.isTextBased()) {
+      console.error(
+        "ERROR: Channel bukan text channel."
+      );
+      return;
+    }
+
+    console.log(
+      `Channel ditemukan: ${channel.name || PANEL_CHANNEL_ID}`
+    );
+
+    /*
+     * Cari panel bot sebelumnya supaya
+     * restart Railway tidak membuat spam panel.
+     */
+    try {
+      const messages = await channel.messages.fetch({
+        limit: 50,
+      });
+
+      const oldPanel = messages.find(
+        (message) =>
+          message.author.id === client.user.id &&
+          message.embeds.length > 0 &&
+          message.embeds[0].title ===
+            "Generate Acc AM Premium"
+      );
+
+      if (oldPanel) {
+        await oldPanel.edit(createPanel());
+
+        console.log(
+          `Panel lama berhasil diperbarui: ${oldPanel.id}`
+        );
+
+        return;
+      }
+    } catch (error) {
+      console.log(
+        "Tidak bisa mencari panel lama, membuat panel baru..."
+      );
+    }
+
+    /*
+     * Kalau belum ada panel,
+     * kirim panel baru.
+     */
+    const sent = await channel.send(createPanel());
+
+    console.log(
+      `Panel berhasil dikirim: ${sent.id}`
+    );
+
+  } catch (error) {
+    console.error(
+      "Gagal setup panel:",
+      error
+    );
+
+    console.error(
+      "Pastikan bot punya permission:",
+      "View Channel, Send Messages, Embed Links, Read Message History"
+    );
+  }
+}
+
+/* =========================
    BOT READY
 ========================= */
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log("--------------------------------");
   console.log(`Bot online: ${client.user.tag}`);
   console.log(`API: ${API_BASE}`);
+  console.log(`Panel Channel: ${PANEL_CHANNEL_ID}`);
   console.log("--------------------------------");
+
+  await setupPanel();
 });
 
 /* =========================
    INTERACTIONS
 ========================= */
 
-client.on("interactionCreate", async (interaction) => {
-  try {
-    /* =====================
-       BUTTON
-    ===================== */
-
-    if (interaction.isButton()) {
-
-      /* SEND BUTTON */
-
-      if (interaction.customId === "am_send") {
-        const modal = new ModalBuilder()
-          .setCustomId("modal_send")
-          .setTitle("Send Email");
-
-        const emailInput = new TextInputBuilder()
-          .setCustomId("email")
-          .setLabel("Email")
-          .setPlaceholder("contoh@gmail.com")
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true)
-          .setMaxLength(254);
-
-        const row = new ActionRowBuilder()
-          .addComponents(emailInput);
-
-        modal.addComponents(row);
-
-        return interaction.showModal(modal);
-      }
-
-      /* VERIFY BUTTON */
-
-      if (interaction.customId === "am_verify") {
-        const session = sessions.get(
-          interaction.user.id
-        );
-
-        if (!session?.email) {
-          return interaction.reply({
-            content:
-              "Kirim email terlebih dahulu melalui tombol **Send Email**.",
-            ephemeral: true,
-          });
-        }
-
-        const modal = new ModalBuilder()
-          .setCustomId("modal_verify")
-          .setTitle("Aktivasi AM Premium");
-
-        const magicInput = new TextInputBuilder()
-          .setCustomId("magic")
-          .setLabel("Magic Link")
-          .setPlaceholder("https://...")
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true);
-
-        const row = new ActionRowBuilder()
-          .addComponents(magicInput);
-
-        modal.addComponents(row);
-
-        return interaction.showModal(modal);
-      }
-
-      /* RESET BUTTON */
-
-      if (interaction.customId === "am_reset") {
-        sessions.delete(interaction.user.id);
-
-        return interaction.reply({
-          content:
-            "Session email kamu berhasil di-reset.",
-          ephemeral: true,
-        });
-      }
-    }
-
-    /* =====================
-       MODAL
-    ===================== */
-
-    if (interaction.isModalSubmit()) {
+client.on(
+  "interactionCreate",
+  async (interaction) => {
+    try {
 
       /* =====================
-         SEND MODAL
+         BUTTON
       ===================== */
 
-      if (interaction.customId === "modal_send") {
-        const email = interaction.fields
-          .getTextInputValue("email")
-          .trim();
+      if (interaction.isButton()) {
 
-        if (!validEmail(email)) {
-          return interaction.reply({
-            content: "Format email tidak valid.",
-            ephemeral: true,
-          });
-        }
+        /* SEND EMAIL */
 
-        await interaction.deferReply({
-          ephemeral: true,
-        });
+        if (
+          interaction.customId === "am_send"
+        ) {
+          const modal = new ModalBuilder()
+            .setCustomId("modal_send")
+            .setTitle("Send Email");
 
-        try {
-          const data = await apiSend(email);
+          const emailInput =
+            new TextInputBuilder()
+              .setCustomId("email")
+              .setLabel("Email")
+              .setPlaceholder(
+                "contoh@gmail.com"
+              )
+              .setStyle(
+                TextInputStyle.Short
+              )
+              .setRequired(true)
+              .setMaxLength(254);
 
-          if (data?.status) {
+          const row =
+            new ActionRowBuilder()
+              .addComponents(
+                emailInput
+              );
 
-            sessions.set(
-              interaction.user.id,
-              {
-                email,
-                sentAt: Date.now(),
-              }
-            );
+          modal.addComponents(row);
 
-            return interaction.editReply(
-              [
-                "✓ **Email berhasil dikirim.**",
-                "",
-                `Email: \`${email}\``,
-                "",
-                "Cek Inbox atau Spam.",
-                "Setelah mendapatkan Magic Link, tekan tombol **Aktivasi**.",
-              ].join("\n")
-            );
-          }
-
-          return interaction.editReply(
-            `Gagal kirim: ${getApiMessage(data)}`
-          );
-
-        } catch (error) {
-          console.error("SEND ERROR:", error);
-
-          return interaction.editReply(
-            `Error API: ${error.message}`
+          return interaction.showModal(
+            modal
           );
         }
-      }
 
-      /* =====================
-         VERIFY MODAL
-      ===================== */
+        /* AKTIVASI */
 
-      if (interaction.customId === "modal_verify") {
-
-        const session = sessions.get(
-          interaction.user.id
-        );
-
-        if (!session?.email) {
-          return interaction.reply({
-            content:
-              "Session email tidak ditemukan. Gunakan **Send Email** terlebih dahulu.",
-            ephemeral: true,
-          });
-        }
-
-        const magicLink = interaction.fields
-          .getTextInputValue("magic")
-          .trim();
-
-        if (!validHttpUrl(magicLink)) {
-          return interaction.reply({
-            content:
-              "Magic Link harus berupa URL HTTP/HTTPS yang valid.",
-            ephemeral: true,
-          });
-        }
-
-        await interaction.deferReply({
-          ephemeral: true,
-        });
-
-        try {
-          const data = await apiVerify(
-            session.email,
-            magicLink
-          );
-
-          if (data?.status) {
-
-            const code = data.codeorder
-              ? `\nCode Order: \`${data.codeorder}\``
-              : "";
-
-            sessions.delete(
+        if (
+          interaction.customId ===
+          "am_verify"
+        ) {
+          const session =
+            sessions.get(
               interaction.user.id
             );
 
-            return interaction.editReply(
-              [
-                "✓ **Aktivasi berhasil**",
-                code,
-              ].join("")
-            );
+          if (!session?.email) {
+            return interaction.reply({
+              content:
+                "❌ Kirim email terlebih dahulu melalui tombol **Send Email**.",
+              ephemeral: true,
+            });
           }
 
-          return interaction.editReply(
-            `Gagal aktivasi: ${getApiMessage(data)}`
-          );
+          const modal =
+            new ModalBuilder()
+              .setCustomId(
+                "modal_verify"
+              )
+              .setTitle(
+                "Aktivasi AM Premium"
+              );
 
-        } catch (error) {
-          console.error("VERIFY ERROR:", error);
+          const magicInput =
+            new TextInputBuilder()
+              .setCustomId("magic")
+              .setLabel(
+                "Magic Link"
+              )
+              .setPlaceholder(
+                "https://..."
+              )
+              .setStyle(
+                TextInputStyle.Paragraph
+              )
+              .setRequired(true);
 
-          return interaction.editReply(
-            `Error API: ${error.message}`
+          const row =
+            new ActionRowBuilder()
+              .addComponents(
+                magicInput
+              );
+
+          modal.addComponents(row);
+
+          return interaction.showModal(
+            modal
           );
         }
+
+        /* RESET */
+
+        if (
+          interaction.customId ===
+          "am_reset"
+        ) {
+          sessions.delete(
+            interaction.user.id
+          );
+
+          return interaction.reply({
+            content:
+              "✅ Session email kamu berhasil di-reset.",
+            ephemeral: true,
+          });
+        }
       }
-    }
 
-  } catch (error) {
-    console.error("INTERACTION ERROR:", error);
+      /* =====================
+         MODAL
+      ===================== */
 
-    try {
       if (
-        interaction.deferred ||
-        interaction.replied
+        interaction.isModalSubmit()
       ) {
-        await interaction.editReply(
-          "Terjadi error internal pada bot."
-        );
-      } else {
-        await interaction.reply({
-          content:
-            "Terjadi error internal pada bot.",
-          ephemeral: true,
-        });
+
+        /* =====================
+           SEND MODAL
+        ===================== */
+
+        if (
+          interaction.customId ===
+          "modal_send"
+        ) {
+          const email =
+            interaction.fields
+              .getTextInputValue(
+                "email"
+              )
+              .trim();
+
+          if (!validEmail(email)) {
+            return interaction.reply({
+              content:
+                "❌ Format email tidak valid.",
+              ephemeral: true,
+            });
+          }
+
+          await interaction.deferReply({
+            ephemeral: true,
+          });
+
+          try {
+            const data =
+              await apiSend(email);
+
+            if (data?.status) {
+
+              sessions.set(
+                interaction.user.id,
+                {
+                  email,
+                  sentAt: Date.now(),
+                }
+              );
+
+              return interaction.editReply(
+                [
+                  "✅ **Email berhasil dikirim.**",
+                  "",
+                  `📧 Email: \`${email}\``,
+                  "",
+                  "Cek Inbox atau Spam.",
+                  "",
+                  "Setelah mendapatkan Magic Link, tekan tombol **Aktivasi**.",
+                ].join("\n")
+              );
+            }
+
+            return interaction.editReply(
+              `❌ Gagal kirim: ${getApiMessage(data)}`
+            );
+
+          } catch (error) {
+            console.error(
+              "SEND ERROR:",
+              error
+            );
+
+            return interaction.editReply(
+              `❌ Error API: ${error.message}`
+            );
+          }
+        }
+
+        /* =====================
+           VERIFY MODAL
+        ===================== */
+
+        if (
+          interaction.customId ===
+          "modal_verify"
+        ) {
+          const session =
+            sessions.get(
+              interaction.user.id
+            );
+
+          if (!session?.email) {
+            return interaction.reply({
+              content:
+                "❌ Session email tidak ditemukan. Gunakan **Send Email** terlebih dahulu.",
+              ephemeral: true,
+            });
+          }
+
+          const magicLink =
+            interaction.fields
+              .getTextInputValue(
+                "magic"
+              )
+              .trim();
+
+          if (
+            !validHttpUrl(
+              magicLink
+            )
+          ) {
+            return interaction.reply({
+              content:
+                "❌ Magic Link harus berupa URL HTTP/HTTPS yang valid.",
+              ephemeral: true,
+            });
+          }
+
+          await interaction.deferReply({
+            ephemeral: true,
+          });
+
+          try {
+            const data =
+              await apiVerify(
+                session.email,
+                magicLink
+              );
+
+            if (data?.status) {
+
+              const code =
+                data.codeorder
+                  ? `\n\nCode Order: \`${data.codeorder}\``
+                  : "";
+
+              sessions.delete(
+                interaction.user.id
+              );
+
+              return interaction.editReply(
+                [
+                  "✅ **Aktivasi berhasil!**",
+                  "",
+                  `Email: \`${session.email}\``,
+                  code,
+                ].join("")
+              );
+            }
+
+            return interaction.editReply(
+              `❌ Gagal aktivasi: ${getApiMessage(data)}`
+            );
+
+          } catch (error) {
+            console.error(
+              "VERIFY ERROR:",
+              error
+            );
+
+            return interaction.editReply(
+              `❌ Error API: ${error.message}`
+            );
+          }
+        }
       }
-    } catch {}
+
+    } catch (error) {
+      console.error(
+        "INTERACTION ERROR:",
+        error
+      );
+
+      try {
+        if (
+          interaction.deferred ||
+          interaction.replied
+        ) {
+          await interaction.editReply(
+            "❌ Terjadi error internal pada bot."
+          );
+        } else {
+          await interaction.reply({
+            content:
+              "❌ Terjadi error internal pada bot.",
+            ephemeral: true,
+          });
+        }
+      } catch {}
+    }
   }
-});
+);
 
 /* =========================
    LOGIN
