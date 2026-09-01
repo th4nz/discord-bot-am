@@ -10,30 +10,34 @@ const {
   TextInputBuilder,
   TextInputStyle,
   EmbedBuilder,
+  PermissionsBitField
 } = require("discord.js");
 
-const { MongoClient } = require("mongodb");
+const mongoose = require("mongoose");
+const User = require("./models/User");
 
 /* =========================================================
    CONFIG
 ========================================================= */
-
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const API_BASE = (
-  process.env.API_BASE || "https://restapidhan.vercel.app"
-).replace(/\/+$/, "");
-
-const API_KEY = process.env.API_KEY;
-const MONGODB_URI = process.env.MONGODB_URI;
 
 const PUBLIC_CHANNEL_ID = "1544164307682721866";
 const ADMIN_CHANNEL_ID = "1544164307682721864";
 const ADMIN_USER_ID = "1403799018487808071";
 
 const DAILY_CREDITS = 2;
+const RESET_TIME = 24 * 60 * 60 * 1000;
+
+const API_BASE = (
+  process.env.API_BASE ||
+  "https://restapidhan.vercel.app"
+).replace(/\/+$/, "");
+
+const API_KEY = process.env.API_KEY;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const MONGODB_URI = process.env.MONGODB_URI;
 
 /* =========================================================
-   VALIDATE ENV
+   ENV CHECK
 ========================================================= */
 
 if (!DISCORD_TOKEN) {
@@ -56,177 +60,27 @@ if (!MONGODB_URI) {
 ========================================================= */
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [
+    GatewayIntentBits.Guilds
+  ]
 });
 
 /* =========================================================
-   MONGODB
+   TEMP SESSION
 ========================================================= */
 
-const mongoClient = new MongoClient(MONGODB_URI);
+const sessions = new Map();
 
-let db;
-let usersCollection;
+/*
+  Format:
 
-async function connectDatabase() {
-  await mongoClient.connect();
-
-  db = mongoClient.db("discord_am_bot");
-
-  usersCollection = db.collection("users");
-
-  await usersCollection.createIndex(
-    { discordId: 1 },
-    { unique: true }
-  );
-
-  console.log("MongoDB connected.");
-}
-
-/* =========================================================
-   USER DATABASE
-========================================================= */
-
-async function getUser(discordId) {
-  let user = await usersCollection.findOne({
-    discordId,
-  });
-
-  const now = new Date();
-
-  if (!user) {
-    user = {
-      discordId,
-      dailyCredits: DAILY_CREDITS,
-      bonusCredits: 0,
-      lastReset: now,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    await usersCollection.insertOne(user);
-
-    return user;
+  Discord ID
+  ↓
+  {
+    email,
+    sentAt
   }
-
-  const lastReset = new Date(user.lastReset);
-
-  const elapsed = now.getTime() - lastReset.getTime();
-
-  const twentyFourHours = 24 * 60 * 60 * 1000;
-
-  if (elapsed >= twentyFourHours) {
-    user.dailyCredits = DAILY_CREDITS;
-    user.lastReset = now;
-    user.updatedAt = now;
-
-    await usersCollection.updateOne(
-      { discordId },
-      {
-        $set: {
-          dailyCredits: DAILY_CREDITS,
-          lastReset: now,
-          updatedAt: now,
-        },
-      }
-    );
-  }
-
-  return user;
-}
-
-/* =========================================================
-   CREDIT INFO
-========================================================= */
-
-async function getCreditInfo(discordId) {
-  const user = await getUser(discordId);
-
-  return {
-    dailyCredits: user.dailyCredits || 0,
-    bonusCredits: user.bonusCredits || 0,
-    totalCredits:
-      (user.dailyCredits || 0) +
-      (user.bonusCredits || 0),
-    lastReset: user.lastReset,
-  };
-}
-
-/* =========================================================
-   CONSUME CREDIT
-========================================================= */
-
-async function consumeCredit(discordId) {
-  const user = await getUser(discordId);
-
-  const daily = user.dailyCredits || 0;
-  const bonus = user.bonusCredits || 0;
-
-  if (daily > 0) {
-    await usersCollection.updateOne(
-      { discordId },
-      {
-        $inc: {
-          dailyCredits: -1,
-        },
-        $set: {
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    return {
-      success: true,
-      type: "daily",
-    };
-  }
-
-  if (bonus > 0) {
-    await usersCollection.updateOne(
-      { discordId },
-      {
-        $inc: {
-          bonusCredits: -1,
-        },
-        $set: {
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    return {
-      success: true,
-      type: "bonus",
-    };
-  }
-
-  return {
-    success: false,
-    type: null,
-  };
-}
-
-/* =========================================================
-   ADMIN ADD CREDIT
-========================================================= */
-
-async function addBonusCredits(discordId, amount) {
-  await getUser(discordId);
-
-  await usersCollection.updateOne(
-    { discordId },
-    {
-      $inc: {
-        bonusCredits: amount,
-      },
-      $set: {
-        updatedAt: new Date(),
-      },
-    }
-  );
-
-  return getCreditInfo(discordId);
-}
+*/
 
 /* =========================================================
    VALIDATION
@@ -250,121 +104,155 @@ function validHttpUrl(value) {
 }
 
 /* =========================================================
-   SESSION
+   USER DATABASE
 ========================================================= */
 
-const sessions = new Map();
+async function getUser(discordId) {
+  let user = await User.findOne({
+    discord_id: discordId
+  });
+
+  if (!user) {
+    user = await User.create({
+      discord_id: discordId,
+      credits: 0,
+      daily_credits: DAILY_CREDITS,
+      last_reset: new Date()
+    });
+  }
+
+  await resetDailyIfNeeded(user);
+
+  return user;
+}
 
 /* =========================================================
-   PUBLIC PANEL
+   DAILY RESET
 ========================================================= */
 
-function createPublicPanel() {
-  const embed = new EmbedBuilder()
-    .setTitle("AM Premium Generator")
-    .setDescription(
-      [
-        "Gunakan tombol di bawah untuk memulai.",
-        "",
-        "📩 **Send Email**",
-        "Kirim email untuk mendapatkan Magic Link.",
-        "",
-        "🔐 **Aktivasi**",
-        "Masukkan Magic Link dari email.",
-        "",
-        "💳 **Credit**",
-        "Setiap user mendapatkan 2 pemakaian setiap 24 jam.",
-        "Credit tambahan diberikan oleh admin.",
-        "",
-        "📊 **Cek Credit**",
-        "Lihat sisa credit kamu."
-      ].join("\n")
-    )
-    .setColor(0x5865f2);
+async function resetDailyIfNeeded(user) {
+  const now = Date.now();
+  const lastReset = new Date(user.last_reset).getTime();
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("am_send")
-      .setLabel("Send Email")
-      .setEmoji("📩")
-      .setStyle(ButtonStyle.Primary),
+  if (now - lastReset >= RESET_TIME) {
+    user.daily_credits = DAILY_CREDITS;
+    user.last_reset = new Date();
 
-    new ButtonBuilder()
-      .setCustomId("am_verify")
-      .setLabel("Aktivasi")
-      .setEmoji("🔐")
-      .setStyle(ButtonStyle.Success),
+    await user.save();
+  }
+}
 
-    new ButtonBuilder()
-      .setCustomId("am_credit")
-      .setLabel("Credit")
-      .setEmoji("💳")
-      .setStyle(ButtonStyle.Secondary),
+/* =========================================================
+   CREDIT DISPLAY
+========================================================= */
 
-    new ButtonBuilder()
-      .setCustomId("am_reset")
-      .setLabel("Reset")
-      .setEmoji("♻️")
-      .setStyle(ButtonStyle.Secondary)
-  );
+function creditText(user) {
+  return [
+    `Daily Credit: **${user.daily_credits}/${DAILY_CREDITS}**`,
+    `Bonus Credit: **${user.credits}**`
+  ].join("\n");
+}
+
+/* =========================================================
+   CREDIT CONSUME
+========================================================= */
+
+async function consumeCredit(discordId) {
+  const user = await getUser(discordId);
+
+  /*
+    Prioritas:
+    1. Daily credit
+    2. Bonus credit
+  */
+
+  if (user.daily_credits > 0) {
+    user.daily_credits -= 1;
+
+    await user.save();
+
+    return {
+      success: true,
+      type: "daily"
+    };
+  }
+
+  if (user.credits > 0) {
+    user.credits -= 1;
+
+    await user.save();
+
+    return {
+      success: true,
+      type: "bonus"
+    };
+  }
 
   return {
-    embeds: [embed],
-    components: [row],
+    success: false
   };
 }
 
 /* =========================================================
-   ADMIN PANEL
+   CREDIT REFUND
 ========================================================= */
 
-function createAdminPanel() {
-  const embed = new EmbedBuilder()
-    .setTitle("🛠️ ADMIN PANEL")
-    .setDescription(
-      [
-        "Panel khusus administrator.",
-        "",
-        "➕ **Tambah Credit**",
-        "Memberikan bonus credit kepada user.",
-        "",
-        "🔎 **Cek User**",
-        "Melihat credit user berdasarkan Discord ID.",
-        "",
-        "📋 **Statistik**",
-        "Melihat jumlah user yang tersimpan.",
-      ].join("\n")
-    )
-    .setColor(0xed4245);
+async function refundCredit(discordId, type) {
+  const user = await getUser(discordId);
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("admin_add_credit")
-      .setLabel("Tambah Credit")
-      .setEmoji("➕")
-      .setStyle(ButtonStyle.Success),
+  if (type === "daily") {
+    user.daily_credits = Math.min(
+      DAILY_CREDITS,
+      user.daily_credits + 1
+    );
+  } else if (type === "bonus") {
+    user.credits += 1;
+  }
 
-    new ButtonBuilder()
-      .setCustomId("admin_check_user")
-      .setLabel("Cek User")
-      .setEmoji("🔎")
-      .setStyle(ButtonStyle.Primary),
-
-    new ButtonBuilder()
-      .setCustomId("admin_stats")
-      .setLabel("Statistik")
-      .setEmoji("📊")
-      .setStyle(ButtonStyle.Secondary)
-  );
-
-  return {
-    embeds: [embed],
-    components: [row],
-  };
+  await user.save();
 }
 
 /* =========================================================
-   SEND API
+   ADD BONUS CREDIT
+========================================================= */
+
+async function addBonusCredit(discordId, amount) {
+  if (!Number.isInteger(amount) || amount <= 0) {
+    throw new Error("Jumlah credit tidak valid.");
+  }
+
+  const user = await getUser(discordId);
+
+  user.credits += amount;
+
+  await user.save();
+
+  return user;
+}
+
+/* =========================================================
+   REMOVE BONUS CREDIT
+========================================================= */
+
+async function removeBonusCredit(discordId, amount) {
+  if (!Number.isInteger(amount) || amount <= 0) {
+    throw new Error("Jumlah credit tidak valid.");
+  }
+
+  const user = await getUser(discordId);
+
+  user.credits = Math.max(
+    0,
+    user.credits - amount
+  );
+
+  await user.save();
+
+  return user;
+}
+
+/* =========================================================
+   API SEND
 ========================================================= */
 
 async function apiSend(email) {
@@ -384,7 +272,7 @@ async function apiSend(email) {
     data = JSON.parse(text);
   } catch {
     throw new Error(
-      `API mengembalikan response bukan JSON (HTTP ${response.status})`
+      `API response bukan JSON. HTTP ${response.status}`
     );
   }
 
@@ -396,7 +284,7 @@ async function apiSend(email) {
 }
 
 /* =========================================================
-   VERIFY API
+   API VERIFY
 ========================================================= */
 
 async function apiVerify(email, magicLink) {
@@ -417,7 +305,7 @@ async function apiVerify(email, magicLink) {
     data = JSON.parse(text);
   } catch {
     throw new Error(
-      `API mengembalikan response bukan JSON (HTTP ${response.status})`
+      `API response bukan JSON. HTTP ${response.status}`
     );
   }
 
@@ -441,6 +329,103 @@ function getApiMessage(data) {
 }
 
 /* =========================================================
+   USER PANEL
+========================================================= */
+
+function createPublicPanel() {
+  const embed = new EmbedBuilder()
+    .setTitle("Generate Acc AM Premium")
+    .setDescription(
+      [
+        "Gunakan tombol di bawah untuk memproses akun.",
+        "",
+        "**Alur:**",
+        "1. Send Email",
+        "2. Cek email Inbox/Spam",
+        "3. Salin Magic Link",
+        "4. Tekan Aktivasi",
+        "",
+        "Setiap user memiliki **2 Daily Credit / 24 jam**.",
+        "Bonus credit diberikan oleh admin."
+      ].join("\n")
+    )
+    .setColor(0xa9cdea);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("am_send")
+      .setLabel("Send Email")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId("am_verify")
+      .setLabel("Aktivasi")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("am_credit")
+      .setLabel("Cek Credit")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("am_reset")
+      .setLabel("Reset Session")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return {
+    embeds: [embed],
+    components: [row]
+  };
+}
+
+/* =========================================================
+   ADMIN PANEL
+========================================================= */
+
+function createAdminPanel() {
+  const embed = new EmbedBuilder()
+    .setTitle("Admin AM Premium")
+    .setDescription(
+      [
+        "Panel administrasi credit.",
+        "",
+        "**Tambah Credit**",
+        "Memberikan bonus credit kepada user.",
+        "",
+        "**Kurangi Credit**",
+        "Mengurangi bonus credit user.",
+        "",
+        "**Cek User**",
+        "Melihat status credit user."
+      ].join("\n")
+    )
+    .setColor(0x5865f2);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("admin_add")
+      .setLabel("Tambah Credit")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("admin_remove")
+      .setLabel("Kurangi Credit")
+      .setStyle(ButtonStyle.Danger),
+
+    new ButtonBuilder()
+      .setCustomId("admin_check")
+      .setLabel("Cek User")
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return {
+    embeds: [embed],
+    components: [row]
+  };
+}
+
+/* =========================================================
    AUTO PUBLIC PANEL
 ========================================================= */
 
@@ -458,39 +443,34 @@ async function setupPublicPanel() {
     }
 
     const messages = await channel.messages.fetch({
-      limit: 20,
+      limit: 50
     });
 
-    const existing = messages.find(
-      (message) =>
+    const existingPanel = messages.find(
+      message =>
         message.author.id === client.user.id &&
-        message.components?.some((row) =>
-          row.components?.some(
-            (component) =>
-              component.customId === "am_send"
-          )
-        )
+        message.embeds?.[0]?.title ===
+          "Generate Acc AM Premium"
     );
 
-    if (existing) {
-      await existing.edit(createPublicPanel());
-
+    if (existingPanel) {
       console.log(
-        "Public panel berhasil diperbarui."
+        "Public panel sudah ada."
       );
-
       return;
     }
 
-    await channel.send(createPublicPanel());
+    await channel.send(
+      createPublicPanel()
+    );
 
     console.log(
-      "Public panel berhasil dibuat."
+      "✓ Public panel berhasil dibuat."
     );
   } catch (error) {
     console.error(
       "PUBLIC PANEL ERROR:",
-      error.message
+      error
     );
   }
 }
@@ -513,40 +493,34 @@ async function setupAdminPanel() {
     }
 
     const messages = await channel.messages.fetch({
-      limit: 20,
+      limit: 50
     });
 
-    const existing = messages.find(
-      (message) =>
+    const existingPanel = messages.find(
+      message =>
         message.author.id === client.user.id &&
-        message.components?.some((row) =>
-          row.components?.some(
-            (component) =>
-              component.customId ===
-              "admin_add_credit"
-          )
-        )
+        message.embeds?.[0]?.title ===
+          "Admin AM Premium"
     );
 
-    if (existing) {
-      await existing.edit(createAdminPanel());
-
+    if (existingPanel) {
       console.log(
-        "Admin panel berhasil diperbarui."
+        "Admin panel sudah ada."
       );
-
       return;
     }
 
-    await channel.send(createAdminPanel());
+    await channel.send(
+      createAdminPanel()
+    );
 
     console.log(
-      "Admin panel berhasil dibuat."
+      "✓ Admin panel berhasil dibuat."
     );
   } catch (error) {
     console.error(
       "ADMIN PANEL ERROR:",
-      error.message
+      error
     );
   }
 }
@@ -557,8 +531,15 @@ async function setupAdminPanel() {
 
 client.once("ready", async () => {
   console.log("--------------------------------");
-  console.log(`Bot online: ${client.user.tag}`);
-  console.log(`API: ${API_BASE}`);
+  console.log(
+    `Bot online: ${client.user.tag}`
+  );
+  console.log(
+    `API: ${API_BASE}`
+  );
+  console.log(
+    `MongoDB: connected`
+  );
   console.log("--------------------------------");
 
   await setupPublicPanel();
@@ -571,43 +552,24 @@ client.once("ready", async () => {
 
 client.on(
   "interactionCreate",
-  async (interaction) => {
+  async interaction => {
+
     try {
+
       /* =====================================================
          BUTTON
       ===================================================== */
 
       if (interaction.isButton()) {
-        const channelId = interaction.channelId;
 
-        /* ================================================
-           PUBLIC PANEL
-        ================================================ */
+        /* -----------------------------------------------
+           USER SEND
+        ------------------------------------------------ */
 
         if (
-          [
-            "am_send",
-            "am_verify",
-            "am_credit",
-            "am_reset",
-          ].includes(interaction.customId)
+          interaction.customId === "am_send"
         ) {
-          if (
-            channelId !== PUBLIC_CHANNEL_ID
-          ) {
-            return interaction.reply({
-              content:
-                "Panel ini hanya bisa digunakan di channel public.",
-              ephemeral: true,
-            });
-          }
-        }
 
-        /* ================================================
-           SEND
-        ================================================ */
-
-        if (interaction.customId === "am_send") {
           const modal = new ModalBuilder()
             .setCustomId("modal_send")
             .setTitle("Send Email");
@@ -625,34 +587,52 @@ client.on(
               .setRequired(true)
               .setMaxLength(254);
 
-          const row =
+          modal.addComponents(
             new ActionRowBuilder().addComponents(
               emailInput
-            );
-
-          modal.addComponents(row);
+            )
+          );
 
           return interaction.showModal(
             modal
           );
         }
 
-        /* ================================================
-           VERIFY
-        ================================================ */
+        /* -----------------------------------------------
+           USER VERIFY
+        ------------------------------------------------ */
 
         if (
           interaction.customId === "am_verify"
         ) {
-          const session = sessions.get(
-            interaction.user.id
-          );
+
+          const session =
+            sessions.get(
+              interaction.user.id
+            );
 
           if (!session?.email) {
             return interaction.reply({
               content:
-                "Kirim email terlebih dahulu melalui tombol **Send Email**.",
-              ephemeral: true,
+                "Kamu belum melakukan **Send Email**.",
+              ephemeral: true
+            });
+          }
+
+          const user =
+            await getUser(
+              interaction.user.id
+            );
+
+          const hasCredit =
+            user.daily_credits > 0 ||
+            user.credits > 0;
+
+          if (!hasCredit) {
+            return interaction.reply({
+              content:
+                "Credit kamu habis. Tunggu reset 24 jam atau hubungi admin untuk mendapatkan bonus credit.",
+              ephemeral: true
             });
           }
 
@@ -674,240 +654,263 @@ client.on(
               )
               .setRequired(true);
 
-          const row =
+          modal.addComponents(
             new ActionRowBuilder().addComponents(
               magicInput
-            );
-
-          modal.addComponents(row);
+            )
+          );
 
           return interaction.showModal(
             modal
           );
         }
 
-        /* ================================================
-           CREDIT
-        ================================================ */
+        /* -----------------------------------------------
+           USER CREDIT
+        ------------------------------------------------ */
 
         if (
-          interaction.customId ===
-          "am_credit"
+          interaction.customId === "am_credit"
         ) {
-          const info =
-            await getCreditInfo(
+
+          const user =
+            await getUser(
               interaction.user.id
             );
 
           return interaction.reply({
             content: [
-              "💳 **Credit Kamu**",
+              "**Credit kamu**",
               "",
-              `Daily Credit: **${info.dailyCredits}**`,
-              `Bonus Credit: **${info.bonusCredits}**`,
-              `Total: **${info.totalCredits}**`,
+              creditText(user),
               "",
-              `Reset daily: <t:${Math.floor(
-                new Date(info.lastReset).getTime() /
-                  1000 +
-                  86400
-              )}:R>`,
+              "Daily credit reset setiap 24 jam."
             ].join("\n"),
-            ephemeral: true,
+            ephemeral: true
           });
         }
 
-        /* ================================================
-           RESET SESSION
-        ================================================ */
+        /* -----------------------------------------------
+           USER RESET
+        ------------------------------------------------ */
 
         if (
-          interaction.customId ===
-          "am_reset"
+          interaction.customId === "am_reset"
         ) {
+
           sessions.delete(
             interaction.user.id
           );
 
           return interaction.reply({
             content:
-              "♻️ Session email kamu berhasil di-reset.",
-            ephemeral: true,
+              "✓ Session email berhasil di-reset.",
+            ephemeral: true
           });
         }
 
-        /* ================================================
-           ADMIN CHECK
-        ================================================ */
+        /* =================================================
+           ADMIN AUTH
+        ================================================= */
+
+        const adminButtons = [
+          "admin_add",
+          "admin_remove",
+          "admin_check"
+        ];
 
         if (
-          interaction.customId.startsWith(
-            "admin_"
+          adminButtons.includes(
+            interaction.customId
           )
         ) {
+
           if (
             interaction.user.id !==
             ADMIN_USER_ID
           ) {
             return interaction.reply({
               content:
-                "❌ Kamu bukan administrator.",
-              ephemeral: true,
+                "Kamu tidak memiliki akses admin.",
+              ephemeral: true
             });
           }
+
+          /* ---------------------------------------------
+             ADD CREDIT
+          --------------------------------------------- */
 
           if (
-            channelId !== ADMIN_CHANNEL_ID
+            interaction.customId ===
+            "admin_add"
           ) {
-            return interaction.reply({
-              content:
-                "❌ Panel admin hanya bisa digunakan di channel admin.",
-              ephemeral: true,
-            });
+
+            const modal = new ModalBuilder()
+              .setCustomId(
+                "modal_admin_add"
+              )
+              .setTitle(
+                "Tambah Bonus Credit"
+              );
+
+            const userId =
+              new TextInputBuilder()
+                .setCustomId("userid")
+                .setLabel(
+                  "Discord User ID"
+                )
+                .setPlaceholder(
+                  "123456789012345678"
+                )
+                .setStyle(
+                  TextInputStyle.Short
+                )
+                .setRequired(true);
+
+            const amount =
+              new TextInputBuilder()
+                .setCustomId("amount")
+                .setLabel(
+                  "Jumlah Credit"
+                )
+                .setPlaceholder("5")
+                .setStyle(
+                  TextInputStyle.Short
+                )
+                .setRequired(true);
+
+            modal.addComponents(
+              new ActionRowBuilder().addComponents(
+                userId
+              ),
+              new ActionRowBuilder().addComponents(
+                amount
+              )
+            );
+
+            return interaction.showModal(
+              modal
+            );
           }
-        }
 
-        /* ================================================
-           ADMIN ADD CREDIT
-        ================================================ */
+          /* ---------------------------------------------
+             REMOVE CREDIT
+          --------------------------------------------- */
 
-        if (
-          interaction.customId ===
-          "admin_add_credit"
-        ) {
-          const modal = new ModalBuilder()
-            .setCustomId(
-              "modal_admin_add_credit"
-            )
-            .setTitle(
-              "Tambah Credit User"
+          if (
+            interaction.customId ===
+            "admin_remove"
+          ) {
+
+            const modal = new ModalBuilder()
+              .setCustomId(
+                "modal_admin_remove"
+              )
+              .setTitle(
+                "Kurangi Bonus Credit"
+              );
+
+            const userId =
+              new TextInputBuilder()
+                .setCustomId("userid")
+                .setLabel(
+                  "Discord User ID"
+                )
+                .setPlaceholder(
+                  "123456789012345678"
+                )
+                .setStyle(
+                  TextInputStyle.Short
+                )
+                .setRequired(true);
+
+            const amount =
+              new TextInputBuilder()
+                .setCustomId("amount")
+                .setLabel(
+                  "Jumlah Credit"
+                )
+                .setPlaceholder("1")
+                .setStyle(
+                  TextInputStyle.Short
+                )
+                .setRequired(true);
+
+            modal.addComponents(
+              new ActionRowBuilder().addComponents(
+                userId
+              ),
+              new ActionRowBuilder().addComponents(
+                amount
+              )
             );
 
-          const userIdInput =
-            new TextInputBuilder()
+            return interaction.showModal(
+              modal
+            );
+          }
+
+          /* ---------------------------------------------
+             CHECK USER
+          --------------------------------------------- */
+
+          if (
+            interaction.customId ===
+            "admin_check"
+          ) {
+
+            const modal = new ModalBuilder()
               .setCustomId(
-                "user_id"
+                "modal_admin_check"
               )
-              .setLabel(
-                "Discord User ID"
-              )
-              .setPlaceholder(
-                "123456789012345678"
-              )
-              .setStyle(
-                TextInputStyle.Short
-              )
-              .setRequired(true);
+              .setTitle(
+                "Cek User"
+              );
 
-          const amountInput =
-            new TextInputBuilder()
-              .setCustomId(
-                "amount"
-              )
-              .setLabel(
-                "Jumlah Credit"
-              )
-              .setPlaceholder(
-                "5"
-              )
-              .setStyle(
-                TextInputStyle.Short
-              )
-              .setRequired(true);
+            const userId =
+              new TextInputBuilder()
+                .setCustomId("userid")
+                .setLabel(
+                  "Discord User ID"
+                )
+                .setPlaceholder(
+                  "123456789012345678"
+                )
+                .setStyle(
+                  TextInputStyle.Short
+                )
+                .setRequired(true);
 
-          modal.addComponents(
-            new ActionRowBuilder().addComponents(
-              userIdInput
-            ),
-            new ActionRowBuilder().addComponents(
-              amountInput
-            )
-          );
-
-          return interaction.showModal(
-            modal
-          );
-        }
-
-        /* ================================================
-           ADMIN CHECK USER
-        ================================================ */
-
-        if (
-          interaction.customId ===
-          "admin_check_user"
-        ) {
-          const modal = new ModalBuilder()
-            .setCustomId(
-              "modal_admin_check_user"
-            )
-            .setTitle(
-              "Cek Credit User"
+            modal.addComponents(
+              new ActionRowBuilder().addComponents(
+                userId
+              )
             );
 
-          const userIdInput =
-            new TextInputBuilder()
-              .setCustomId(
-                "user_id"
-              )
-              .setLabel(
-                "Discord User ID"
-              )
-              .setPlaceholder(
-                "123456789012345678"
-              )
-              .setStyle(
-                TextInputStyle.Short
-              )
-              .setRequired(true);
-
-          modal.addComponents(
-            new ActionRowBuilder().addComponents(
-              userIdInput
-            )
-          );
-
-          return interaction.showModal(
-            modal
-          );
-        }
-
-        /* ================================================
-           ADMIN STATS
-        ================================================ */
-
-        if (
-          interaction.customId ===
-          "admin_stats"
-        ) {
-          const total =
-            await usersCollection.countDocuments();
-
-          return interaction.reply({
-            content: [
-              "📊 **Bot Statistics**",
-              "",
-              `Total user tersimpan: **${total}**`,
-              `Daily credit/user: **${DAILY_CREDITS}**`,
-            ].join("\n"),
-            ephemeral: true,
-          });
+            return interaction.showModal(
+              modal
+            );
+          }
         }
       }
 
-      /* ===================================================
+      /* =====================================================
          MODAL
-      =================================================== */
+      ===================================================== */
 
-      if (interaction.isModalSubmit()) {
-        /* ================================================
+      if (
+        interaction.isModalSubmit()
+      ) {
+
+        /* =================================================
            SEND EMAIL
-        ================================================ */
+        ================================================= */
 
         if (
           interaction.customId ===
           "modal_send"
         ) {
+
           const email =
             interaction.fields
               .getTextInputValue(
@@ -919,106 +922,68 @@ client.on(
             return interaction.reply({
               content:
                 "Format email tidak valid.",
-              ephemeral: true,
+              ephemeral: true
             });
           }
 
           await interaction.deferReply({
-            ephemeral: true,
+            ephemeral: true
           });
 
-          /* CHECK CREDIT */
-
-          const info =
-            await getCreditInfo(
-              interaction.user.id
-            );
-
-          if (
-            info.totalCredits <= 0
-          ) {
-            return interaction.editReply(
-              [
-                "❌ **Credit habis.**",
-                "",
-                "Kamu sudah tidak memiliki credit.",
-                "Tunggu reset harian atau hubungi admin untuk bonus credit.",
-              ].join("\n")
-            );
-          }
-
           try {
-            /* CALL API */
 
             const data =
               await apiSend(email);
 
             if (data?.status) {
-              /* CONSUME ONLY AFTER SUCCESS */
-
-              const consumed =
-                await consumeCredit(
-                  interaction.user.id
-                );
-
-              if (!consumed.success) {
-                return interaction.editReply(
-                  "Credit tidak cukup."
-                );
-              }
 
               sessions.set(
                 interaction.user.id,
                 {
                   email,
-                  sentAt: Date.now(),
+                  sentAt: Date.now()
                 }
               );
 
-              const after =
-                await getCreditInfo(
-                  interaction.user.id
-                );
-
               return interaction.editReply(
                 [
-                  "✅ **Email berhasil dikirim.**",
+                  "✓ **Email berhasil dikirim.**",
                   "",
                   `Email: \`${email}\``,
                   "",
                   "Cek Inbox atau Spam.",
-                  "Setelah mendapatkan Magic Link, tekan tombol **Aktivasi**.",
                   "",
-                  `Credit tersisa: **${after.totalCredits}**`,
+                  "Setelah mendapatkan Magic Link, tekan tombol **Aktivasi**."
                 ].join("\n")
               );
             }
 
             return interaction.editReply(
-              `❌ Gagal kirim: ${getApiMessage(
-                data
-              )}`
+              `Gagal kirim: ${getApiMessage(data)}`
             );
+
           } catch (error) {
+
             console.error(
               "SEND ERROR:",
               error
             );
 
             return interaction.editReply(
-              `❌ Error API: ${error.message}`
+              `Error API: ${error.message}`
             );
           }
         }
 
-        /* ================================================
+        /* =================================================
            VERIFY
-        ================================================ */
+        ================================================= */
 
         if (
           interaction.customId ===
           "modal_verify"
         ) {
+
           const session =
             sessions.get(
               interaction.user.id
@@ -1027,8 +992,8 @@ client.on(
           if (!session?.email) {
             return interaction.reply({
               content:
-                "Session email tidak ditemukan. Gunakan **Send Email** terlebih dahulu.",
-              ephemeral: true,
+                "Session email tidak ditemukan. Silakan Send Email lagi.",
+              ephemeral: true
             });
           }
 
@@ -1047,15 +1012,35 @@ client.on(
             return interaction.reply({
               content:
                 "Magic Link harus berupa URL HTTP/HTTPS yang valid.",
-              ephemeral: true,
+              ephemeral: true
+            });
+          }
+
+          /*
+            Reserve credit SEBELUM API verify.
+            Ini mencegah dua request bersamaan
+            menghabiskan credit yang sama.
+          */
+
+          const consumed =
+            await consumeCredit(
+              interaction.user.id
+            );
+
+          if (!consumed.success) {
+            return interaction.reply({
+              content:
+                "Credit kamu habis.",
+              ephemeral: true
             });
           }
 
           await interaction.deferReply({
-            ephemeral: true,
+            ephemeral: true
           });
 
           try {
+
             const data =
               await apiVerify(
                 session.email,
@@ -1063,70 +1048,86 @@ client.on(
               );
 
             if (data?.status) {
-              const code =
-                data.codeorder
-                  ? `\nCode Order: \`${data.codeorder}\``
-                  : "";
 
               sessions.delete(
                 interaction.user.id
               );
 
-              const info =
-                await getCreditInfo(
+              const user =
+                await getUser(
                   interaction.user.id
                 );
 
+              const code =
+                data.codeorder
+                  ? `\nCode Order: \`${data.codeorder}\``
+                  : "";
+
               return interaction.editReply(
                 [
-                  "✅ **Aktivasi berhasil**",
+                  "✓ **Aktivasi berhasil.**",
                   code,
                   "",
-                  `Credit tersisa: **${info.totalCredits}**`,
-                ].join("")
+                  creditText(user)
+                ].join("\n")
               );
             }
 
-            return interaction.editReply(
-              `❌ Gagal aktivasi: ${getApiMessage(
-                data
-              )}`
+            /*
+              API gagal → credit dikembalikan.
+            */
+
+            await refundCredit(
+              interaction.user.id,
+              consumed.type
             );
+
+            return interaction.editReply(
+              `Gagal aktivasi: ${getApiMessage(data)}\n\nCredit dikembalikan.`
+            );
+
           } catch (error) {
+
             console.error(
               "VERIFY ERROR:",
               error
             );
 
+            await refundCredit(
+              interaction.user.id,
+              consumed.type
+            );
+
             return interaction.editReply(
-              `❌ Error API: ${error.message}`
+              `Error API: ${error.message}\n\nCredit dikembalikan.`
             );
           }
         }
 
-        /* ================================================
-           ADMIN ADD CREDIT
-        ================================================ */
+        /* =================================================
+           ADMIN ADD
+        ================================================= */
 
         if (
           interaction.customId ===
-          "modal_admin_add_credit"
+          "modal_admin_add"
         ) {
+
           if (
             interaction.user.id !==
             ADMIN_USER_ID
           ) {
             return interaction.reply({
               content:
-                "❌ Unauthorized.",
-              ephemeral: true,
+                "Unauthorized.",
+              ephemeral: true
             });
           }
 
-          const userId =
+          const discordId =
             interaction.fields
               .getTextInputValue(
-                "user_id"
+                "userid"
               )
               .trim();
 
@@ -1141,159 +1142,251 @@ client.on(
             Number(amountText);
 
           if (
-            !/^\d{15,20}$/.test(
-              userId
-            )
-          ) {
-            return interaction.reply({
-              content:
-                "❌ Discord User ID tidak valid.",
-              ephemeral: true,
-            });
-          }
-
-          if (
+            !/^\d+$/.test(discordId) ||
             !Number.isInteger(amount) ||
-            amount <= 0 ||
-            amount > 10000
+            amount <= 0
           ) {
             return interaction.reply({
               content:
-                "❌ Jumlah credit harus angka bulat antara 1 sampai 10000.",
-              ephemeral: true,
+                "Discord ID atau jumlah credit tidak valid.",
+              ephemeral: true
             });
           }
 
-          const info =
-            await addBonusCredits(
-              userId,
-              amount
-            );
+          try {
 
-          return interaction.reply({
-            content: [
-              "✅ **Credit berhasil ditambahkan.**",
-              "",
-              `User: <@${userId}>`,
-              `Ditambahkan: **+${amount}**`,
-              "",
-              `Daily Credit: **${info.dailyCredits}**`,
-              `Bonus Credit: **${info.bonusCredits}**`,
-              `Total: **${info.totalCredits}**`,
-            ].join("\n"),
-            ephemeral: true,
-          });
+            const user =
+              await addBonusCredit(
+                discordId,
+                amount
+              );
+
+            return interaction.reply({
+              content: [
+                "✓ **Credit berhasil ditambahkan.**",
+                "",
+                `User: \`${discordId}\``,
+                `Ditambahkan: **+${amount}**`,
+                `Bonus Credit sekarang: **${user.credits}**`,
+                `Daily Credit: **${user.daily_credits}/${DAILY_CREDITS}**`
+              ].join("\n"),
+              ephemeral: true
+            });
+
+          } catch (error) {
+
+            return interaction.reply({
+              content:
+                `Gagal: ${error.message}`,
+              ephemeral: true
+            });
+          }
         }
 
-        /* ================================================
-           ADMIN CHECK USER
-        ================================================ */
+        /* =================================================
+           ADMIN REMOVE
+        ================================================= */
 
         if (
           interaction.customId ===
-          "modal_admin_check_user"
+          "modal_admin_remove"
         ) {
+
           if (
             interaction.user.id !==
             ADMIN_USER_ID
           ) {
             return interaction.reply({
               content:
-                "❌ Unauthorized.",
-              ephemeral: true,
+                "Unauthorized.",
+              ephemeral: true
             });
           }
 
-          const userId =
+          const discordId =
             interaction.fields
               .getTextInputValue(
-                "user_id"
+                "userid"
+              )
+              .trim();
+
+          const amountText =
+            interaction.fields
+              .getTextInputValue(
+                "amount"
+              )
+              .trim();
+
+          const amount =
+            Number(amountText);
+
+          if (
+            !/^\d+$/.test(discordId) ||
+            !Number.isInteger(amount) ||
+            amount <= 0
+          ) {
+            return interaction.reply({
+              content:
+                "Discord ID atau jumlah credit tidak valid.",
+              ephemeral: true
+            });
+          }
+
+          try {
+
+            const user =
+              await removeBonusCredit(
+                discordId,
+                amount
+              );
+
+            return interaction.reply({
+              content: [
+                "✓ **Credit berhasil dikurangi.**",
+                "",
+                `User: \`${discordId}\``,
+                `Dikurangi: **-${amount}**`,
+                `Bonus Credit sekarang: **${user.credits}**`,
+                `Daily Credit: **${user.daily_credits}/${DAILY_CREDITS}**`
+              ].join("\n"),
+              ephemeral: true
+            });
+
+          } catch (error) {
+
+            return interaction.reply({
+              content:
+                `Gagal: ${error.message}`,
+              ephemeral: true
+            });
+          }
+        }
+
+        /* =================================================
+           ADMIN CHECK
+        ================================================= */
+
+        if (
+          interaction.customId ===
+          "modal_admin_check"
+        ) {
+
+          if (
+            interaction.user.id !==
+            ADMIN_USER_ID
+          ) {
+            return interaction.reply({
+              content:
+                "Unauthorized.",
+              ephemeral: true
+            });
+          }
+
+          const discordId =
+            interaction.fields
+              .getTextInputValue(
+                "userid"
               )
               .trim();
 
           if (
-            !/^\d{15,20}$/.test(
-              userId
-            )
+            !/^\d+$/.test(discordId)
           ) {
             return interaction.reply({
               content:
-                "❌ Discord User ID tidak valid.",
-              ephemeral: true,
+                "Discord User ID tidak valid.",
+              ephemeral: true
             });
           }
 
-          const info =
-            await getCreditInfo(
-              userId
+          const user =
+            await getUser(
+              discordId
             );
 
           return interaction.reply({
             content: [
-              "🔎 **User Credit**",
+              "**Informasi User**",
               "",
-              `User: <@${userId}>`,
+              `Discord ID: \`${discordId}\``,
               "",
-              `Daily Credit: **${info.dailyCredits}**`,
-              `Bonus Credit: **${info.bonusCredits}**`,
-              `Total: **${info.totalCredits}**`,
-              "",
-              `Last Reset: <t:${Math.floor(
-                new Date(
-                  info.lastReset
-                ).getTime() /
-                  1000
-              )}:R>`,
+              `Daily Credit: **${user.daily_credits}/${DAILY_CREDITS}**`,
+              `Bonus Credit: **${user.credits}**`,
+              `Created: <t:${Math.floor(new Date(user.created_at).getTime() / 1000)}:F>`,
+              `Last Reset: <t:${Math.floor(new Date(user.last_reset).getTime() / 1000)}:F>`
             ].join("\n"),
-            ephemeral: true,
+            ephemeral: true
           });
         }
       }
+
     } catch (error) {
+
       console.error(
         "INTERACTION ERROR:",
         error
       );
 
       try {
+
         if (
           interaction.deferred ||
           interaction.replied
         ) {
           await interaction.editReply(
-            "❌ Terjadi error internal pada bot."
+            "Terjadi error internal pada bot."
           );
         } else {
           await interaction.reply({
             content:
-              "❌ Terjadi error internal pada bot.",
-            ephemeral: true,
+              "Terjadi error internal pada bot.",
+            ephemeral: true
           });
         }
+
       } catch {}
     }
   }
 );
 
 /* =========================================================
-   START
+   MONGODB
 ========================================================= */
 
-async function start() {
-  try {
-    await connectDatabase();
+async function connectMongo() {
 
-    await client.login(
-      DISCORD_TOKEN
+  try {
+
+    await mongoose.connect(
+      MONGODB_URI
     );
+
+    console.log(
+      "✓ MongoDB connected."
+    );
+
   } catch (error) {
+
     console.error(
-      "START ERROR:",
+      "MongoDB connection failed:",
       error
     );
 
     process.exit(1);
   }
+}
+
+/* =========================================================
+   START
+========================================================= */
+
+async function start() {
+
+  await connectMongo();
+
+  await client.login(
+    DISCORD_TOKEN
+  );
 }
 
 start();
