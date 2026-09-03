@@ -36,11 +36,14 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 /* =========================================================
-   DISCORD CLIENT
+   DISCORD CLIENT (DENGAN INTENTS LENGKAP)
 ========================================================= */
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages
+  ]
 });
 
 /* =========================================================
@@ -49,15 +52,6 @@ const client = new Client({
 
 function validEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-function validHttpUrl(value) {
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
 }
 
 async function getUser(discordId) {
@@ -145,10 +139,6 @@ async function apiSend(email) {
   return data;
 }
 
-/* =========================================================
-   API CHECK LIMIT / STATUS
-========================================================= */
-
 async function apiCheckLimit() {
   const url = new URL(`${API_BASE}/api/key/status`);
   url.searchParams.set("apikey", API_KEY);
@@ -169,14 +159,10 @@ function getApiMessage(data) {
 }
 
 /* =========================================================
-   USER PANEL (DENGAN TOMBOL CEK LIMIT API)
+   PANEL BUILDERS
 ========================================================= */
 
-function createPublicPanel(user = null) {
-  const creditDisplay = user 
-    ? creditText(user) 
-    : `Daily Credit: **${DAILY_CREDITS}/${DAILY_CREDITS}**\nBonus Credit: **0**`;
-
+function createPublicPanel() {
   const embed = new EmbedBuilder()
     .setTitle("Generate Acc AM Premium")
     .setDescription(
@@ -190,7 +176,8 @@ function createPublicPanel(user = null) {
         "",
         "---",
         "**Status Credit Kamu:**",
-        creditDisplay,
+        `Daily Credit: **${DAILY_CREDITS}/${DAILY_CREDITS}**`,
+        `Bonus Credit: **0**`,
         "",
         "*Credit akan terupdate otomatis.*"
       ].join("\n")
@@ -214,10 +201,6 @@ function createPublicPanel(user = null) {
   };
 }
 
-/* =========================================================
-   ADMIN PANEL
-========================================================= */
-
 function createAdminPanel() {
   const embed = new EmbedBuilder()
     .setTitle("Admin AM Premium")
@@ -233,36 +216,54 @@ function createAdminPanel() {
   return { embeds: [embed], components: [row] };
 }
 
-async function setupPublicPanel() {
-  try {
-    const channel = await client.channels.fetch(PUBLIC_CHANNEL_ID);
-    if (!channel || !channel.isTextBased()) return;
-    const messages = await channel.messages.fetch({ limit: 50 });
-    const existingPanel = messages.find(m => m.author.id === client.user.id && m.embeds?.[0]?.title === "Generate Acc AM Premium");
-    if (existingPanel) return;
-    await channel.send(createPublicPanel());
-  } catch (error) {
-    console.error("PUBLIC PANEL ERROR:", error);
-  }
-}
+/* =========================================================
+   AUTO SETUP PANELS (DENGAN ERROR HANDLER)
+========================================================= */
 
-async function setupAdminPanel() {
+async function setupPanels() {
   try {
-    const channel = await client.channels.fetch(ADMIN_CHANNEL_ID);
-    if (!channel || !channel.isTextBased()) return;
-    const messages = await channel.messages.fetch({ limit: 50 });
-    const existingPanel = messages.find(m => m.author.id === client.user.id && m.embeds?.[0]?.title === "Admin AM Premium");
-    if (existingPanel) return;
-    await channel.send(createAdminPanel());
+    // Setup Public Panel
+    const pubChannel = await client.channels.fetch(PUBLIC_CHANNEL_ID).catch(() => null);
+    if (pubChannel && pubChannel.isTextBased()) {
+      const messages = await pubChannel.messages.fetch({ limit: 20 }).catch(() => null);
+      const existingPanel = messages?.find(m => m.author.id === client.user.id && m.embeds?.[0]?.title === "Generate Acc AM Premium");
+      
+      if (!existingPanel) {
+        await pubChannel.send(createPublicPanel());
+        console.log("✓ Public panel berhasil dikirim ke channel.");
+      } else {
+        console.log("✓ Public panel sudah ada di channel.");
+      }
+    } else {
+      console.warn("⚠ Public channel tidak ditemukan atau bot tidak memiliki akses.");
+    }
+
+    // Setup Admin Panel
+    const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID).catch(() => null);
+    if (adminChannel && adminChannel.isTextBased()) {
+      const messages = await adminChannel.messages.fetch({ limit: 20 }).catch(() => null);
+      const existingAdminPanel = messages?.find(m => m.author.id === client.user.id && m.embeds?.[0]?.title === "Admin AM Premium");
+      
+      if (!existingAdminPanel) {
+        await adminChannel.send(createAdminPanel());
+        console.log("✓ Admin panel berhasil dikirim ke channel.");
+      } else {
+        console.log("✓ Admin panel sudah ada di channel.");
+      }
+    } else {
+      console.warn("⚠ Admin channel tidak ditemukan atau bot tidak memiliki akses.");
+    }
   } catch (error) {
-    console.error("ADMIN PANEL ERROR:", error);
+    console.error("PANEL SETUP ERROR:", error);
   }
 }
 
 client.once("ready", async () => {
+  console.log(`--------------------------------`);
   console.log(`Bot online: ${client.user.tag}`);
-  await setupPublicPanel();
-  await setupAdminPanel();
+  console.log(`--------------------------------`);
+
+  await setupPanels();
 });
 
 /* =========================================================
@@ -289,9 +290,6 @@ client.on("interactionCreate", async interaction => {
         return interaction.showModal(modal);
       }
 
-      /* -----------------------------------------------
-         HANDLER TOMBOL CEK LIMIT API
-      ------------------------------------------------ */
       if (interaction.customId === "api_limit") {
         await interaction.deferReply({ ephemeral: true });
         const res = await apiCheckLimit();
@@ -350,8 +348,6 @@ client.on("interactionCreate", async interaction => {
     if (interaction.isModalSubmit()) {
       if (interaction.customId === "modal_send") {
         const email = interaction.fields.getTextInputValue("email").trim();
-        if (!validEmail(email)) return interaction.reply({ content: "Email tidak valid.", ephemeral: true });
-
         const consumed = await consumeCredit(interaction.user.id);
         if (!consumed.success) return interaction.reply({ content: "Credit kamu habis.", ephemeral: true });
 
