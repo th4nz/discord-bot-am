@@ -145,18 +145,23 @@ async function apiSend(email) {
   return data;
 }
 
-async function apiVerify(email, magicLink) {
-  const url = new URL(`${API_BASE}/api/am`);
-  url.searchParams.set("action", "verif");
+/* =========================================================
+   API CHECK LIMIT / STATUS
+========================================================= */
+
+async function apiCheckLimit() {
+  const url = new URL(`${API_BASE}/api/key/status`);
   url.searchParams.set("apikey", API_KEY);
-  url.searchParams.set("email", email);
-  url.searchParams.set("url", magicLink);
-  const response = await fetch(url);
-  const text = await response.text();
-  let data;
-  try { data = JSON.parse(text); } catch { throw new Error(`API response bukan JSON.`); }
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return data;
+  try {
+    const response = await fetch(url);
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch { return { ok: false, error: "Response bukan JSON" }; }
+    if (!response.ok) return { ok: false, error: data?.error || `HTTP ${response.status}` };
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 function getApiMessage(data) {
@@ -164,7 +169,7 @@ function getApiMessage(data) {
 }
 
 /* =========================================================
-   USER PANEL (DENGAN REALTIME CREDIT DISPLAY)
+   USER PANEL (DENGAN TOMBOL CEK LIMIT API)
 ========================================================= */
 
 function createPublicPanel(user = null) {
@@ -196,7 +201,11 @@ function createPublicPanel(user = null) {
     new ButtonBuilder()
       .setCustomId("am_send")
       .setLabel("Send Email")
-      .setStyle(ButtonStyle.Primary)
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("api_limit")
+      .setLabel("Cek Limit API")
+      .setStyle(ButtonStyle.Secondary)
   );
 
   return {
@@ -278,6 +287,36 @@ client.on("interactionCreate", async interaction => {
         const emailInput = new TextInputBuilder().setCustomId("email").setLabel("Email").setPlaceholder("contoh@gmail.com").setStyle(TextInputStyle.Short).setRequired(true);
         modal.addComponents(new ActionRowBuilder().addComponents(emailInput));
         return interaction.showModal(modal);
+      }
+
+      /* -----------------------------------------------
+         HANDLER TOMBOL CEK LIMIT API
+      ------------------------------------------------ */
+      if (interaction.customId === "api_limit") {
+        await interaction.deferReply({ ephemeral: true });
+        const res = await apiCheckLimit();
+        
+        if (!res.ok) {
+          await interaction.editReply(`Gagal mengambil status API: ${res.error}`);
+          setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
+          return;
+        }
+
+        const data = res.data || {};
+        const dailyUsage = data.dailyUsage ?? data.usage ?? 0;
+        const dailyLimit = data.dailyLimit ?? data.limit ?? "Unlimited";
+
+        await interaction.editReply(
+          [
+            "📊 **Status / Limit API Key**",
+            "",
+            `Status: **${data.active !== false ? "Aktif" : "Tidak Aktif"}**`,
+            `Penggunaan Hari Ini: \`${dailyUsage} / ${dailyLimit}\``
+          ].join("\n")
+        );
+
+        setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
+        return;
       }
 
       const adminButtons = ["admin_add", "admin_remove", "admin_check"];
@@ -376,4 +415,3 @@ async function start() {
 }
 
 start();
-
