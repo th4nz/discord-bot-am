@@ -36,7 +36,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 /* =========================================================
-   DISCORD CLIENT (DENGAN INTENTS LENGKAP)
+   DISCORD CLIENT
 ========================================================= */
 
 const client = new Client({
@@ -139,21 +139,6 @@ async function apiSend(email) {
   return data;
 }
 
-async function apiCheckLimit() {
-  const url = new URL(`${API_BASE}/api/key/status`);
-  url.searchParams.set("apikey", API_KEY);
-  try {
-    const response = await fetch(url);
-    const text = await response.text();
-    let data;
-    try { data = JSON.parse(text); } catch { return { ok: false, error: "Response bukan JSON" }; }
-    if (!response.ok) return { ok: false, error: data?.error || `HTTP ${response.status}` };
-    return { ok: true, data };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-}
-
 function getApiMessage(data) {
   return data?.error || data?.message || "Unknown error";
 }
@@ -190,8 +175,8 @@ function createPublicPanel() {
       .setLabel("Send Email")
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId("api_limit")
-      .setLabel("Cek Limit API")
+      .setCustomId("am_credit")
+      .setLabel("Cek Credit")
       .setStyle(ButtonStyle.Secondary)
   );
 
@@ -217,12 +202,11 @@ function createAdminPanel() {
 }
 
 /* =========================================================
-   AUTO SETUP PANELS (DENGAN ERROR HANDLER)
+   AUTO SETUP PANELS
 ========================================================= */
 
 async function setupPanels() {
   try {
-    // Setup Public Panel
     const pubChannel = await client.channels.fetch(PUBLIC_CHANNEL_ID).catch(() => null);
     if (pubChannel && pubChannel.isTextBased()) {
       const messages = await pubChannel.messages.fetch({ limit: 20 }).catch(() => null);
@@ -234,11 +218,8 @@ async function setupPanels() {
       } else {
         console.log("✓ Public panel sudah ada di channel.");
       }
-    } else {
-      console.warn("⚠ Public channel tidak ditemukan atau bot tidak memiliki akses.");
     }
 
-    // Setup Admin Panel
     const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID).catch(() => null);
     if (adminChannel && adminChannel.isTextBased()) {
       const messages = await adminChannel.messages.fetch({ limit: 20 }).catch(() => null);
@@ -250,8 +231,6 @@ async function setupPanels() {
       } else {
         console.log("✓ Admin panel sudah ada di channel.");
       }
-    } else {
-      console.warn("⚠ Admin channel tidak ditemukan atau bot tidak memiliki akses.");
     }
   } catch (error) {
     console.error("PANEL SETUP ERROR:", error);
@@ -290,30 +269,29 @@ client.on("interactionCreate", async interaction => {
         return interaction.showModal(modal);
       }
 
-      if (interaction.customId === "api_limit") {
-        await interaction.deferReply({ ephemeral: true });
-        const res = await apiCheckLimit();
-        
-        if (!res.ok) {
-          await interaction.editReply(`Gagal mengambil status API: ${res.error}`);
-          setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
-          return;
-        }
+      /* -----------------------------------------------
+         HANDLER TOMBOL CEK CREDIT
+      ------------------------------------------------ */
+      if (interaction.customId === "am_credit") {
+        const user = await getUser(interaction.user.id);
 
-        const data = res.data || {};
-        const dailyUsage = data.dailyUsage ?? data.usage ?? 0;
-        const dailyLimit = data.dailyLimit ?? data.limit ?? "Unlimited";
-
-        await interaction.editReply(
-          [
-            "📊 **Status / Limit API Key**",
+        await interaction.reply({
+          content: [
+            "💳 **Informasi Credit Anda**",
             "",
-            `Status: **${data.active !== false ? "Aktif" : "Tidak Aktif"}**`,
-            `Penggunaan Hari Ini: \`${dailyUsage} / ${dailyLimit}\``
-          ].join("\n")
-        );
+            creditText(user),
+            "",
+            "Daily credit akan di-reset otomatis setiap 24 jam."
+          ].join("\n"),
+          ephemeral: true
+        });
 
-        setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
+        setTimeout(async () => {
+          try {
+            await interaction.editReply({ content: "", components: [] });
+          } catch {}
+        }, 3000);
+
         return;
       }
 
