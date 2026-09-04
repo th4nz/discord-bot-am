@@ -1,24 +1,48 @@
 require("dotenv").config();
-const { Telegraf, Markup } = require("telegraf");
+
+const {
+  Client,
+  GatewayIntentBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  EmbedBuilder
+} = require("discord.js");
+
 const mongoose = require("mongoose");
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const MONGODB_URI = process.env.MONGODB_URI;
+/* =========================================================
+   CONFIG
+========================================================= */
+
+const PUBLIC_CHANNEL_ID = process.env.PUBLIC_CHANNEL_ID || "1544164307682721866";
+const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID || "1544164307682721864";
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "1403799018487808071";
 
 const DAILY_CREDITS = 2;
 const RESET_TIME = 24 * 60 * 60 * 1000;
 
-const API_BASE = (process.env.API_BASE || "https://restapidhan.vercel.app").replace(/\/+$/, "");
-const API_KEY = process.env.API_KEY;
+const API_BASE = (
+  process.env.API_BASE ||
+  "https://restapidhan.vercel.app"
+).replace(/\/+$/, "");
 
-if (!BOT_TOKEN || !MONGODB_URI || !API_KEY) {
-  console.error("ERROR: BOT_TOKEN, MONGODB_URI, atau API_KEY belum lengkap di environment variables.");
+const API_KEY = process.env.API_KEY;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const MONGODB_URI = process.env.MONGODB_URI;
+
+if (!DISCORD_TOKEN || !API_KEY || !MONGODB_URI) {
+  console.error("ERROR: Variabel lingkungan (DISCORD_TOKEN, API_KEY, atau MONGODB_URI) belum lengkap.");
   process.exit(1);
 }
 
 /* =========================================================
-   MONGODB USER SCHEMA (Dibuat Dalam 1 File Agar Tidak Crash)
+   MONGODB USER SCHEMA (Inline untuk Mencegah Crash)
 ========================================================= */
+
 const userSchema = new mongoose.Schema({
   discord_id: { type: String, required: true, unique: true },
   credits: { type: Number, default: 0 },
@@ -28,18 +52,30 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model("User", userSchema);
 
-const bot = new Telegraf(BOT_TOKEN);
-const sessions = new Map(); // Menyimpan state step user (email & magic link)
-
 /* =========================================================
-   DATABASE UTILS & DAILY RESET
+   DISCORD CLIENT
 ========================================================= */
 
-async function getUser(telegramId) {
-  let user = await User.findOne({ discord_id: String(telegramId) });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages
+  ]
+});
+
+/* =========================================================
+   VALIDATION & DB UTILS
+========================================================= */
+
+function validEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+async function getUser(discordId) {
+  let user = await User.findOne({ discord_id: String(discordId) });
   if (!user) {
     user = await User.create({
-      discord_id: String(telegramId),
+      discord_id: String(discordId),
       credits: 0,
       daily_credits: DAILY_CREDITS,
       last_reset: new Date()
@@ -61,13 +97,13 @@ async function resetDailyIfNeeded(user) {
 
 function creditText(user) {
   return [
-    `Daily Credit: <b>${user.daily_credits}/${DAILY_CREDITS}</b>`,
-    `Bonus Credit: <b>${user.credits}</b>`
+    `Daily Credit: **${user.daily_credits}/${DAILY_CREDITS}**`,
+    `Bonus Credit: **${user.credits}**`
   ].join("\n");
 }
 
-async function consumeCredit(telegramId) {
-  const user = await getUser(telegramId);
+async function consumeCredit(discordId) {
+  const user = await getUser(discordId);
   if (user.daily_credits > 0) {
     user.daily_credits -= 1;
     await user.save();
@@ -81,8 +117,8 @@ async function consumeCredit(telegramId) {
   return { success: false };
 }
 
-async function refundCredit(telegramId, type) {
-  const user = await getUser(telegramId);
+async function refundCredit(discordId, type) {
+  const user = await getUser(discordId);
   if (type === "daily") {
     user.daily_credits = Math.min(DAILY_CREDITS, user.daily_credits + 1);
   } else if (type === "bonus") {
@@ -104,183 +140,196 @@ async function apiSend(email) {
   return data;
 }
 
-async function apiVerify(email, magicLink) {
-  const url = new URL(`${API_BASE}/api/am`);
-  url.searchParams.set("action", "verif");
-  url.searchParams.set("apikey", API_KEY);
-  url.searchParams.set("email", email);
-  url.searchParams.set("url", magicLink);
-  const response = await fetch(url);
-  const text = await response.text();
-  let data;
-  try { data = JSON.parse(text); } catch { throw new Error("API response bukan JSON."); }
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return data;
-}
-
-function validEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-function validHttpUrl(value) {
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
+function getApiMessage(data) {
+  return data?.error || data?.message || "Unknown error";
 }
 
 /* =========================================================
-   TELEGRAM COMMANDS & UI PANELS
+   PANEL BUILDERS
 ========================================================= */
 
-const mainKeyboard = Markup.inlineKeyboard([
-  [Markup.button.callback("📧 Send Email", "btn_send"), Markup.button.callback("💳 Cek Credit", "btn_credit")]
-]);
+function createPublicPanel() {
+  const embed = new EmbedBuilder()
+    .setTitle("Generate Acc AM Premium")
+    .setDescription(
+      [
+        "Gunakan tombol di bawah untuk memproses akun.",
+        "",
+        "**Alur:**",
+        "1. Send Email",
+        "2. Cek email Inbox/Spam",
+        "3. Masukkan Magic Link",
+        "",
+        "---",
+        "**Status Credit Kamu:**",
+        `Daily Credit: **${DAILY_CREDITS}/${DAILY_CREDITS}**`,
+        `Bonus Credit: **0**`,
+        "",
+        "*Credit akan terupdate otomatis.*"
+      ].join("\n")
+    )
+    .setColor(0xa9cdea);
 
-async function sendDashboard(ctx, userId) {
-  const user = await getUser(userId);
-  const caption = [
-    "<b>Generate Acc AM Premium</b>",
-    "",
-    "Gunakan tombol di bawah untuk memproses akun.",
-    "",
-    "<b>Alur:</b>",
-    "1. Send Email",
-    "2. Cek email Inbox/Spam",
-    "3. Masukkan Magic Link",
-    "",
-    "---",
-    "<b>Status Credit Kamu:</b>",
-    creditText(user),
-    "",
-    "<i>Credit akan terupdate otomatis.</i>"
-  ].join("\n");
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("am_send")
+      .setLabel("Send Email")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("am_credit")
+      .setLabel("Cek Credit")
+      .setStyle(ButtonStyle.Secondary)
+  );
 
-  await ctx.reply(caption, { parse_mode: "HTML", ...mainKeyboard });
+  return {
+    embeds: [embed],
+    components: [row]
+  };
 }
 
-bot.start(async (ctx) => {
-  await sendDashboard(ctx, ctx.from.id);
-});
+function createAdminPanel() {
+  const embed = new EmbedBuilder()
+    .setTitle("Admin AM Premium")
+    .setDescription("Panel administrasi credit.")
+    .setColor(0x5865f2);
 
-bot.action("btn_credit", async (ctx) => {
-  const user = await getUser(ctx.from.id);
-  await ctx.answerCbQuery();
-  await ctx.reply(`💳 <b>Informasi Credit Anda</b>\n\n${creditText(user)}`, { parse_mode: "HTML" });
-});
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("admin_add").setLabel("Tambah Credit").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("admin_remove").setLabel("Kurangi Credit").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("admin_check").setLabel("Cek User").setStyle(ButtonStyle.Primary)
+  );
 
-bot.action("btn_send", async (ctx) => {
-  const user = await getUser(ctx.from.id);
-  if (user.daily_credits <= 0 && user.credits <= 0) {
-    return ctx.answerCbQuery("Credit kamu habis! Hubungi admin.", { show_alert: true });
-  }
+  return { embeds: [embed], components: [row] };
+}
 
-  sessions.set(ctx.from.id, { step: "awaiting_email" });
-  await ctx.answerCbQuery();
-  await ctx.reply("✉️ Silakan masukkan alamat email tujuan untuk dikirimkan link verifikasi:", Markup.inlineKeyboard([
-    [Markup.button.callback("❌ Batal", "btn_cancel")]
-  ]));
-});
+/* =========================================================
+   AUTO SETUP PANELS
+========================================================= */
 
-bot.action("btn_cancel", async (ctx) => {
-  sessions.delete(ctx.from.id);
-  await ctx.answerCbQuery("Dibatalkan.");
-  await ctx.editMessageText("Sesi dibatalkan.");
-});
-
-// Multi-step text input listener (Email & Magic Link)
-bot.on("text", async (ctx) => {
-  const userId = ctx.from.id;
-  const session = sessions.get(userId);
-  if (!session) return;
-
-  // STEP 1: PROSES EMAIL
-  if (session.step === "awaiting_email") {
-    const email = ctx.message.text.trim();
-    if (!validEmail(email)) {
-      return ctx.reply("Format email tidak valid. Masukkan email yang benar (contoh: user@gmail.com):");
-    }
-
-    const processingMsg = await ctx.reply("⏳ Memproses pengiriman email...");
-
-    const consumed = await consumeCredit(userId);
-    if (!consumed.success) {
-      await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
-      sessions.delete(userId);
-      return ctx.reply("Credit kamu habis.");
-    }
-
-    try {
-      const data = await apiSend(email);
-      await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
-
-      if (data?.status) {
-        sessions.set(userId, { step: "awaiting_verify", email, consumedType: consumed.type });
-        
-        await ctx.reply(
-          [
-            `✓ <b>Email berhasil dikirim ke</b> <code>${email}</code>.`,
-            "",
-            "Silakan periksa Inbox/Spam email Anda. Setelah mendapatkan <b>Magic Link</b>, kirimkan link tersebut ke sini:",
-          ].join("\n"),
-          { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("❌ Batal", "btn_cancel")]]) }
-        );
-      } else {
-        await refundCredit(userId, consumed.type);
-        sessions.delete(userId);
-        await ctx.reply(`Gagal: ${data?.error || data?.message || "Unknown error"}. Credit dikembalikan.`);
+async function setupPanels() {
+  try {
+    const pubChannel = await client.channels.fetch(PUBLIC_CHANNEL_ID).catch(() => null);
+    if (pubChannel && pubChannel.isTextBased()) {
+      const messages = await pubChannel.messages.fetch({ limit: 20 }).catch(() => null);
+      const existingPanel = messages?.find(m => m.author.id === client.user.id && m.embeds?.[0]?.title === "Generate Acc AM Premium");
+      
+      if (!existingPanel) {
+        await pubChannel.send(createPublicPanel());
+        console.log("✓ Public panel berhasil dikirim ke channel.");
       }
-    } catch (e) {
-      await refundCredit(userId, consumed.type);
-      sessions.delete(userId);
-      await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
-      await ctx.reply(`Error API: ${e.message}. Credit dikembalikan.`);
-    }
-    return;
-  }
-
-  // STEP 2: PROSES MAGIC LINK VERIFICATION
-  if (session.step === "awaiting_verify") {
-    const magicLink = ctx.message.text.trim();
-    if (!validHttpUrl(magicLink)) {
-      return ctx.reply("Magic Link harus berupa URL HTTP/HTTPS yang valid. Silakan kirimkan ulang link yang benar:");
     }
 
-    const email = session.email;
-    const consumedType = session.consumedType;
-    sessions.delete(userId);
-
-    const processingMsg = await ctx.reply("⏳ Memproses verifikasi akun...");
-
-    try {
-      const data = await apiVerify(email, magicLink);
-      await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
-
-      if (data?.status) {
-        const user = await getUser(userId);
-        const codeOrder = data.codeorder ? `\nCode Order: <code>${data.codeorder}</code>` : "";
-
-        await ctx.reply(
-          [
-            "✓ <b>Aktivasi Berhasil!</b>",
-            codeOrder,
-            "",
-            creditText(user)
-          ].join("\n"),
-          { parse_mode: "HTML", ...mainKeyboard }
-        );
-      } else {
-        await refundCredit(userId, consumedType);
-        await ctx.reply(`Gagal verifikasi: ${data?.error || data?.message || "Unknown error"}.\n\nCredit kamu dikembalikan.`);
+    const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID).catch(() => null);
+    if (adminChannel && adminChannel.isTextBased()) {
+      const messages = await adminChannel.messages.fetch({ limit: 20 }).catch(() => null);
+      const existingAdminPanel = messages?.find(m => m.author.id === client.user.id && m.embeds?.[0]?.title === "Admin AM Premium");
+      
+      if (!existingAdminPanel) {
+        await adminChannel.send(createAdminPanel());
+        console.log("✓ Admin panel berhasil dikirim ke channel.");
       }
-    } catch (e) {
-      await refundCredit(userId, consumedType);
-      await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
-      await ctx.reply(`Error API verifikasi: ${e.message}.\n\nCredit kamu dikembalikan.`);
     }
-    return;
+  } catch (error) {
+    console.error("PANEL SETUP ERROR:", error);
+  }
+}
+
+client.once("ready", async () => {
+  console.log(`--------------------------------`);
+  console.log(`Bot Discord online: ${client.user.tag}`);
+  console.log(`--------------------------------`);
+  await setupPanels();
+});
+
+/* =========================================================
+   INTERACTIONS
+========================================================= */
+
+client.on("interactionCreate", async interaction => {
+  try {
+    if (interaction.isButton()) {
+      if (interaction.customId === "am_send") {
+        const user = await getUser(interaction.user.id);
+        const hasCredit = user.daily_credits > 0 || user.credits > 0;
+
+        if (!hasCredit) {
+          return interaction.reply({
+            content: "Credit kamu habis. Tunggu reset 24 jam atau hubungi admin.",
+            ephemeral: true
+          });
+        }
+
+        const modal = new ModalBuilder().setCustomId("modal_send").setTitle("Send Email");
+        const emailInput = new TextInputBuilder().setCustomId("email").setLabel("Email").setPlaceholder("contoh@gmail.com").setStyle(TextInputStyle.Short).setRequired(true);
+        modal.addComponents(new ActionRowBuilder().addComponents(emailInput));
+        return interaction.showModal(modal);
+      }
+
+      if (interaction.customId === "am_credit") {
+        const user = await getUser(interaction.user.id);
+
+        await interaction.reply({
+          content: [
+            "💳 **Informasi Credit Anda**",
+            "",
+            creditText(user),
+            "",
+            "Daily credit akan di-reset otomatis setiap 24 jam."
+          ].join("\n"),
+          ephemeral: true
+        });
+
+        setTimeout(async () => {
+          try {
+            await interaction.editReply({ content: "", components: [] });
+          } catch {}
+        }, 3000);
+
+        return;
+      }
+    }
+
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === "modal_send") {
+        const email = interaction.fields.getTextInputValue("email").trim();
+        if (!validEmail(email)) {
+          return interaction.reply({ content: "Format email tidak valid.", ephemeral: true });
+        }
+
+        const consumed = await consumeCredit(interaction.user.id);
+        if (!consumed.success) {
+          return interaction.reply({ content: "Credit kamu habis.", ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+        try {
+          const data = await apiSend(email);
+          if (data?.status) {
+            const user = await getUser(interaction.user.id);
+            await interaction.editReply(
+              [
+                `✓ **Email terkirim ke** \`${email}\`.`,
+                "",
+                creditText(user)
+              ].join("\n")
+            );
+
+            setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
+            return;
+          }
+
+          await refundCredit(interaction.user.id, consumed.type);
+          await interaction.editReply(`Gagal: ${getApiMessage(data)}. Credit dikembalikan.`);
+          setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
+        } catch (e) {
+          await refundCredit(interaction.user.id, consumed.type);
+          await interaction.editReply(`Error: ${e.message}. Credit dikembalikan.`);
+          setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
+        }
+      }
+    }
+  } catch (error) {
+    console.error("INTERACTION ERROR:", error);
   }
 });
 
@@ -288,17 +337,12 @@ bot.on("text", async (ctx) => {
    START MONGODB & BOT
 ========================================================= */
 
-async function startBot() {
+async function start() {
   await mongoose.connect(MONGODB_URI);
   console.log("✓ MongoDB connected successfully.");
-
-  await bot.launch();
-  console.log("✓ Telegram Bot running via Long Polling...");
+  await client.login(DISCORD_TOKEN);
 }
 
-startBot().catch((err) => {
-  console.error("Failed to start bot:", err);
+start().catch(err => {
+  console.error("Gagal menjalankan bot:", err);
 });
-
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
