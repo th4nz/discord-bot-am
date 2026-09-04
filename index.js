@@ -53,7 +53,7 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model("User", userSchema);
 
 /* =========================================================
-   DISCORD CLIENT
+   DISCORD CLIENT & SESSIONS
 ========================================================= */
 
 const client = new Client({
@@ -63,12 +63,23 @@ const client = new Client({
   ]
 });
 
+const userSessions = new Map(); // Menyimpan email sementara untuk verifikasi
+
 /* =========================================================
    VALIDATION & DB UTILS
 ========================================================= */
 
 function validEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function validHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 async function getUser(discordId) {
@@ -132,6 +143,20 @@ async function apiSend(email) {
   url.searchParams.set("action", "send");
   url.searchParams.set("apikey", API_KEY);
   url.searchParams.set("email", email);
+  const response = await fetch(url);
+  const text = await response.text();
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error("API response bukan JSON."); }
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return data;
+}
+
+async function apiVerify(email, magicLink) {
+  const url = new URL(`${API_BASE}/api/am`);
+  url.searchParams.set("action", "verif");
+  url.searchParams.set("apikey", API_KEY);
+  url.searchParams.set("email", email);
+  url.searchParams.set("url", magicLink);
   const response = await fetch(url);
   const text = await response.text();
   let data;
@@ -242,7 +267,7 @@ client.once("ready", async () => {
 });
 
 /* =========================================================
-   INTERACTIONS
+   INTERACTIONS (BUTTONS & MODALS)
 ========================================================= */
 
 client.on("interactionCreate", async interaction => {
@@ -259,8 +284,17 @@ client.on("interactionCreate", async interaction => {
           });
         }
 
-        const modal = new ModalBuilder().setCustomId("modal_send").setTitle("Send Email");
-        const emailInput = new TextInputBuilder().setCustomId("email").setLabel("Email").setPlaceholder("contoh@gmail.com").setStyle(TextInputStyle.Short).setRequired(true);
+        const modal = new ModalBuilder()
+          .setCustomId("modal_send")
+          .setTitle("Send Email");
+
+        const emailInput = new TextInputBuilder()
+          .setCustomId("email")
+          .setLabel("Email")
+          .setPlaceholder("contoh@gmail.com")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
+
         modal.addComponents(new ActionRowBuilder().addComponents(emailInput));
         return interaction.showModal(modal);
       }
@@ -290,6 +324,7 @@ client.on("interactionCreate", async interaction => {
     }
 
     if (interaction.isModalSubmit()) {
+      // 1. SUBMIT EMAIL & LANJUT MUNCULKAN MODAL MAGIC LINK
       if (interaction.customId === "modal_send") {
         const email = interaction.fields.getTextInputValue("email").trim();
         if (!validEmail(email)) {
@@ -305,10 +340,65 @@ client.on("interactionCreate", async interaction => {
         try {
           const data = await apiSend(email);
           if (data?.status) {
+            // Simpan email & tipe credit yang dikonsumsi ke session sementara
+            userSessions.set(interaction.user.id, { email, consumedType: consumed.type });
+
+            await interaction.editReply(
+              `✓ **Email berhasil dikirim ke** \`${email}\`.\n\nSilakan cek inbox/spam email kamu, lalu masukkan Magic Link pada form berikutnya.`
+            );
+
+            // Munculkan Modal Magic Link otomatis menggunakan showModal (atau lewat followUp pesan dengan tombol modal)
+            // Karena Discord tidak mendukung pemanggilan showModal langsung setelah deferReply, 
+            // Kita berikan tombol interaktif untuk membuka modal verifikasi Magic Link agar UX-nya mulus:
+            const verifyRow = new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setCustomId("open_verify_modal")
+                .setLabel("🔗 Masukkan Magic Link")
+                .setStyle(ButtonStyle.Success)
+            );
+
+            await interaction.followUp({
+              content: "Klik tombol di bawah ini untuk memasukkan Magic Link verifikasi:",
+              components: [verifyRow],
+              ephemeral: true
+            });
+            return;
+          }
+
+          await refundCredit(interaction.user.id, consumed.type);
+          await interaction.editReply(`Gagal: ${getApiMessage(data)}. Credit dikembalikan.`);
+        } catch (e) {
+          await refundCredit(interaction.user.id, consumed.type);
+          await interaction.editReply(`Error: ${e.message}. Credit dikembalikan.`);
+        }
+      }
+
+      // 3. SUBMIT MAGIC LINK DARI MODAL VERIFIKASI
+      if (interaction.customId === "modal_verify") {
+        const magicLink = interaction.fields.getTextInputValue("magic_link").trim();
+        const session = userSessions.get(interaction.user.id);
+
+        if (!session || !session.email) {
+          return interaction.reply({ content: "Sesi email tidak ditemukan. Silakan ulangi proses dari awal.", ephemeral: true });
+        }
+
+        if (!validHttpUrl(magicLink)) {
+          return interaction.reply({ content: "Magic Link harus berupa URL HTTP/HTTPS yang valid.", ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const data = await apiVerify(session.email, magicLink);
+          if (data?.status) {
+            userSessions.delete(interaction.user.id);
             const user = await getUser(interaction.user.id);
+            const codeOrder = data.codeorder ? `\nCode Order: \`${data.codeorder}\`` : "";
+
             await interaction.editReply(
               [
-                `✓ **Email terkirim ke** \`${email}\`.`,
+                "✓ **Aktivasi Akun Berhasil!**",
+                codeOrder,
                 "",
                 creditText(user)
               ].join("\n")
@@ -318,16 +408,40 @@ client.on("interactionCreate", async interaction => {
             return;
           }
 
-          await refundCredit(interaction.user.id, consumed.type);
-          await interaction.editReply(`Gagal: ${getApiMessage(data)}. Credit dikembalikan.`);
-          setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
+          // Jika verifikasi gagal, kembalikan credit
+          await refundCredit(interaction.user.id, session.consumedType);
+          userSessions.delete(interaction.user.id);
+          await interaction.editReply(`Gagal verifikasi: ${getApiMessage(data)}\n\nCredit kamu dikembalikan.`);
         } catch (e) {
-          await refundCredit(interaction.user.id, consumed.type);
-          await interaction.editReply(`Error: ${e.message}. Credit dikembalikan.`);
-          setTimeout(async () => { try { await interaction.editReply({ content: "", components: [] }); } catch {} }, 3000);
+          await refundCredit(interaction.user.id, session.consumedType);
+          userSessions.delete(interaction.user.id);
+          await interaction.editReply(`Error API verifikasi: ${e.message}\n\nCredit kamu dikembalikan.`);
         }
       }
     }
+
+    // 2. TOMBOL UNTUK MEMBUKA MODAL VERIFIKASI MAGIC LINK
+    if (interaction.isButton() && interaction.customId === "open_verify_modal") {
+      const session = userSessions.get(interaction.user.id);
+      if (!session) {
+        return interaction.reply({ content: "Sesi kedaluwarsa atau tidak ditemukan. Silakan kirim email ulang.", ephemeral: true });
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId("modal_verify")
+        .setTitle("Verifikasi Magic Link");
+
+      const linkInput = new TextInputBuilder()
+        .setCustomId("magic_link")
+        .setLabel("Tempel Magic Link Di Sini")
+        .setPlaceholder("https://alight-creative.com/...")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(linkInput));
+      return interaction.showModal(modal);
+    }
+
   } catch (error) {
     console.error("INTERACTION ERROR:", error);
   }
