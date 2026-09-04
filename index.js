@@ -1,11 +1,9 @@
 require("dotenv").config();
 const { Telegraf, Markup } = require("telegraf");
 const mongoose = require("mongoose");
-const User = require("./models/User");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
-const ADMIN_USER_ID = Number(process.env.ADMIN_USER_ID || 0);
 
 const DAILY_CREDITS = 2;
 const RESET_TIME = 24 * 60 * 60 * 1000;
@@ -17,6 +15,18 @@ if (!BOT_TOKEN || !MONGODB_URI || !API_KEY) {
   console.error("ERROR: BOT_TOKEN, MONGODB_URI, atau API_KEY belum lengkap di environment variables.");
   process.exit(1);
 }
+
+/* =========================================================
+   MONGODB USER SCHEMA (Dibuat Dalam 1 File Agar Tidak Crash)
+========================================================= */
+const userSchema = new mongoose.Schema({
+  discord_id: { type: String, required: true, unique: true },
+  credits: { type: Number, default: 0 },
+  daily_credits: { type: Number, default: DAILY_CREDITS },
+  last_reset: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model("User", userSchema);
 
 const bot = new Telegraf(BOT_TOKEN);
 const sessions = new Map(); // Menyimpan state step user (email & magic link)
@@ -207,7 +217,6 @@ bot.on("text", async (ctx) => {
       await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
 
       if (data?.status) {
-        // Simpan email dan ubah step menjadi menunggu magic link
         sessions.set(userId, { step: "awaiting_verify", email, consumedType: consumed.type });
         
         await ctx.reply(
